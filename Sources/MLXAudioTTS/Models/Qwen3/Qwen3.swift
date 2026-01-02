@@ -761,6 +761,7 @@ public class Qwen3Model: Module, KVCacheDimensionProvider {
                     }
 
                     let audio = decodeAudioFromCodes(codeList: codeList, snacModel: snacModel)
+                    audio.eval()
 
                     // Yield completion info
                     let info = Qwen3GenerationInfo(
