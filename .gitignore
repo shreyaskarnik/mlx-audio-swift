@@ -2,10 +2,9 @@
 .swiftpm
 .DS_Store
 .xcbkptlist
-.resolved
-.xcuserdata
-.xcuserstate
-.xcuserdatad
-.xcuserdatad/xcdebugger
-.xcuserdatad/xcdebugger/Breakpoints_v2.xcbkptlist
-.xcuserdatad/xcdebugger/Breakpoints_v2.xcbkptlist
+*.resolved
+*.xcuserdata
+*.xcuserstate
+*.xcuserdatad
+*.xcuserdatad/xcdebugger
+*.xcuserdatad/xcdebugger/Breakpoints_v2.xcbkptlist
