@@ -26,6 +26,7 @@ public class Sequential: Module, UnaryLayer {
         for layer in layers {
             result = (layer as! UnaryLayer).callAsFunction(result)
         }
+        eval(result)
         return result
     }
 }
