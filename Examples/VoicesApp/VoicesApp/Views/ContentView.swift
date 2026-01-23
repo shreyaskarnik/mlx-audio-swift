@@ -265,6 +265,15 @@ struct ContentView: View {
                 .presentationDragIndicator(.visible)
                 #endif
         }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                viewModel.pause()
+                viewModel.stop()
+            default:
+                break
+            }
+        }
         .task {
             await viewModel.loadModel()
         }
