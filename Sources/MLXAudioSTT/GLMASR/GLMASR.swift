@@ -7,7 +7,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 import MLXNN
 import MLXAudioCore
 import MLXLMCommon
@@ -650,7 +649,7 @@ public class GLMASRModel: Module {
         audioLength: [[Int]]?,
         cache: [KVCache]?
     ) -> MLXArray {
-        var textEmbeds = getInputEmbeddings()(inputIds)
+        let textEmbeds = getInputEmbeddings()(inputIds)
 
         // Skip if no audio or cache already populated
         guard let audioEmbeds = audioEmbeds else { return textEmbeds }

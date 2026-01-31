@@ -10,7 +10,6 @@ import Foundation
 import HuggingFace
 import Tokenizers
 import MLXLMCommon
-import MLXFast
 import MLXNN
 import MLXAudioCore
 
@@ -587,10 +586,10 @@ public class SopranoModel: Module, KVCacheDimensionProvider {
                 for await (token, hiddenState) in self.streamGenerate(
                     inputIds: inputIds,
                     maxTokens: maxTokens,
-                    temperature: parameters.temperature ?? 0.3,
-                    topP: parameters.topP ?? 0.95,
+                    temperature: parameters.temperature,
+                    topP: parameters.topP,
                     repetitionPenalty: parameters.repetitionPenalty ?? 1.0,  // Match Python (no penalty)
-                    repetitionContextSize: parameters.repetitionContextSize ?? 30
+                    repetitionContextSize: parameters.repetitionContextSize
                 ) {
                     allHiddenStates.append(hiddenState)
 
@@ -669,10 +668,10 @@ public class SopranoModel: Module, KVCacheDimensionProvider {
                         for await (token, hiddenState) in self.streamGenerate(
                             inputIds: inputIds,
                             maxTokens: maxTokens,
-                            temperature: parameters.temperature ?? 0.3,
-                            topP: parameters.topP ?? 0.95,
+                            temperature: parameters.temperature,
+                            topP: parameters.topP,
                             repetitionPenalty: parameters.repetitionPenalty ?? 1.0,  // Match Python (no penalty)
-                            repetitionContextSize: parameters.repetitionContextSize ?? 30
+                            repetitionContextSize: parameters.repetitionContextSize
                         ) {
                             allHiddenStates.append(hiddenState)
 
@@ -770,7 +769,7 @@ public class SopranoModel: Module, KVCacheDimensionProvider {
                 // Generate tokens
                 var currentLogits = logits
 
-                for tokenIdx in 0..<maxTokens {
+                for _ in 0..<maxTokens {
                     // Get last logits
                     var lastLogits = currentLogits[0..., -1, 0...]
                     eval(lastLogits)
@@ -794,12 +793,6 @@ public class SopranoModel: Module, KVCacheDimensionProvider {
                     }
 
                     let tokenId = nextToken.item(Int.self)
-
-                    // Debug: show top 5 logits and stop token logit
-                    if tokenIdx < 5 || tokenIdx % 50 == 0 {
-                        let top5Indices = argSort(-lastLogits, axis: -1)[0..<5]
-                        let stopLogit = lastLogits.ndim == 2 ? lastLogits[0, 3] : lastLogits[3]
-                    }
 
                     // Check for stop token ([STOP] = token ID 3)
                     if tokenId == self.stopTokenId {
@@ -978,7 +971,6 @@ private struct TopPSampler {
         // Create inverse indices to map back to original order
         // This replicates Python's put_along_axis approach
         let vocabSize = sortedIndices.shape[0]
-        let arange = MLXArray(Int32(0)..<Int32(vocabSize))
 
         // Create inverse mapping: for each position in original order,
         // find its cumulative probability

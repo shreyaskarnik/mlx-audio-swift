@@ -10,7 +10,6 @@ import Foundation
 import HuggingFace
 import Tokenizers
 import MLXLMCommon
-import MLXFast
 import MLXNN
 import MLXAudioCodecs
 import MLXAudioCore

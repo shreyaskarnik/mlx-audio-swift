@@ -30,11 +30,10 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", branch: "main"),
-        .package(url: "https://github.com/Blaizzy/mlx-swift-lm.git", branch: "main"),
-        .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMinor(from: "1.1.0")),
-        .package(url: "https://github.com/Blaizzy/swift-huggingface.git", branch: "main")
-
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.3")),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMajor(from: "2.30.3")),
+        .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.6.0"))
     ],
     targets: [
         // MARK: - MLXAudioCore
@@ -76,10 +75,7 @@ let package = Package(
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
-            path: "Sources/MLXAudioTTS",
-            resources: [
-                .process("Models/Kokoro/Resources")
-            ]
+            path: "Sources/MLXAudioTTS"
         ),
 
         // MARK: - MLXAudioSTT
@@ -117,7 +113,6 @@ let package = Package(
                 "MLXAudioCore",
                 "MLXAudioTTS",
                 "MLXAudioSTS",
-                .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/MLXAudioUI"
         ),
