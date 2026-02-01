@@ -1,12 +1,32 @@
 import AVFoundation
 import Foundation
-import HuggingFace
-import Hub
 @preconcurrency import MLX
-import MLXNN
-import MLXAudioCore
 import MLXAudioTTS
 import MLXLMCommon
+
+enum AppError: Error, LocalizedError, CustomStringConvertible {
+    case invalidRepositoryID(String)
+    case unsupportedModelType(String?)
+    case failedToCreateAudioBuffer
+    case failedToAccessAudioBufferData
+
+    var errorDescription: String? {
+        description
+    }
+
+    var description: String {
+        switch self {
+        case .invalidRepositoryID(let model):
+            "Invalid repository ID: \(model)"
+        case .unsupportedModelType(let modelType):
+            "Unsupported model type: \(String(describing: modelType))"
+        case .failedToCreateAudioBuffer:
+            "Failed to create audio buffer"
+        case .failedToAccessAudioBufferData:
+            "Failed to access audio buffer data"
+        }
+    }
+}
 
 @main
 enum App {
@@ -34,31 +54,29 @@ enum App {
         hfToken: String? = nil
     ) async throws {
         Memory.cacheLimit = 100 * 1024 * 1024
-        
-        print("Loading model (\(model))…")
-        
+
+        print("Loading model (\(model))")
+
         // Check for HF token in environment (macOS) or Info.plist (iOS) as a fallback
         let hfToken: String? = hfToken ?? ProcessInfo.processInfo.environment["HF_TOKEN"] ?? Bundle.main.object(forInfoDictionaryKey: "HF_TOKEN") as? String
-        
-        guard let repoID = Repo.ID(rawValue: model) else {
-            throw AppError.invalidRepositoryID(model)
-        }
-        let modelType = try await ModelUtils.resolveModelType(repoID: repoID, hfToken: hfToken)
-        
+
         let loadedModel: SpeechGenerationModel
-        
-        switch modelType {
-        case "qwen3_tts":
-            loadedModel = try await Qwen3Model.fromPretrained(model)
-        default:
-            throw AppError.unsupportedModelType(modelType)
+        do {
+            loadedModel = try await TTSModelUtils.loadModel(modelRepo: model, hfToken: hfToken)
+        } catch let error as TTSModelUtilsError {
+            switch error {
+            case .invalidRepositoryID(let modelRepo):
+                throw AppError.invalidRepositoryID(modelRepo)
+            case .unsupportedModelType(let modelType):
+                throw AppError.unsupportedModelType(modelType)
+            }
         }
-        
-        print("Generating…")
+
+        print("Generating")
         let started = CFAbsoluteTimeGetCurrent()
-        
+
         let audioData = try await loadedModel.generate(text: text, voice: voice, generationParameters: GenerateParameters()).asArray(Float.self)
-        
+
         let outputURL = makeOutputURL(outputPath: outputPath)
         let sampleRate = Double(loadedModel.sampleRate)
         try writeWavFile(samples: audioData, sampleRate: sampleRate, outputURL: outputURL)
@@ -90,7 +108,7 @@ enum App {
         guard let channelData = buffer.floatChannelData else {
             throw AppError.failedToAccessAudioBufferData
         }
-        for i in 0..<samples.count {
+        for i in 0 ..< samples.count {
             channelData[0][i] = samples[i]
         }
         let audioFile = try AVAudioFile(forWriting: outputURL, settings: format.settings)
@@ -98,33 +116,7 @@ enum App {
     }
 }
 
-// MARK: - App errors
-
-enum AppError: Error, LocalizedError, CustomStringConvertible {
-    case invalidRepositoryID(String)
-    case unsupportedModelType(String?)
-    case failedToCreateAudioBuffer
-    case failedToAccessAudioBufferData
-
-    var errorDescription: String? {
-        description
-    }
-
-    var description: String {
-        switch self {
-        case .invalidRepositoryID(let model):
-            return "Invalid repository ID: \(model)"
-        case .unsupportedModelType(let modelType):
-            return "Unsupported model type: \(String(describing: modelType))"
-        case .failedToCreateAudioBuffer:
-            return "Failed to create audio buffer"
-        case .failedToAccessAudioBufferData:
-            return "Failed to access audio buffer data"
-        }
-    }
-}
-
-// MARK: - Minimal CLI parser
+// MARK: -
 
 enum CLIError: Error, CustomStringConvertible {
     case missingValue(String)
