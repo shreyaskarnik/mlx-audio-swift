@@ -155,8 +155,23 @@ public final class PocketTTSModel: Module, SpeechGenerationModel, @unchecked Sen
         }
 
         _ = runFlowLMAndIncrementStep(&state, audioConditioning: conditioning)
-        // NOTE: We do not slice cache here yet (KVCacheSimple does not expose keys/values).
+        sliceFlowCache(&state, to: conditioning.shape[1])
         return state
+    }
+
+    private func sliceFlowCache(_ state: inout PocketTTSState, to length: Int) {
+        guard length > 0 else { return }
+        for cache in state.flowCache {
+            let s = cache.state
+            guard s.count == 2 else { continue }
+            let keys = s[0]
+            let values = s[1]
+            let end = min(length, keys.shape[2])
+            let slicedKeys = keys[.ellipsis, ..<end, 0...]
+            let slicedValues = values[.ellipsis, ..<end, 0...]
+            cache.state = [slicedKeys, slicedValues]
+            cache.offset = min(cache.offset, end)
+        }
     }
 
     public func generateAudio(
