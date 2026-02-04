@@ -87,7 +87,7 @@ public final class PocketTTSModel: Module, SpeechGenerationModel, @unchecked Sen
     private func encodeAudio(_ audio: MLXArray) -> MLXArray {
         let encoded = mimi.encodeToLatent(audio)
         let latents = encoded.transposed(0, 2, 1).asType(.float32)
-        let projT = speaker_proj_weight.transposed(0, 1)
+        let projT = speaker_proj_weight.transposed(1, 0)
         let conditioning = matmul(latents, projT)
         return conditioning
     }

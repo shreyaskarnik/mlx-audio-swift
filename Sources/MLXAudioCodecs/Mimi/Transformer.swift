@@ -163,7 +163,18 @@ public final class Attention: Module {
             v = split(v, indices: [start], axis: 2)[1]
         }
 
-        var out = scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: mask)
+        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = {
+            if let mask { return .array(mask) }
+            return cfg.causal ? createAttentionMask(h: xs, cache: cache) : .none
+        }()
+
+        var out = MLXFast.scaledDotProductAttention(
+            queries: q,
+            keys: k,
+            values: v,
+            scale: scale,
+            mask: maskMode
+        )
         out = swappedAxes(out, 1, 2).reshaped([b, t, hd])
         return out_proj(out)
     }
@@ -214,7 +225,7 @@ public final class MlpNoGating: Module {
     }
 
     public func callAsFunction(_ xs: MLXArray) -> MLXArray {
-        linear2(geluApprox(linear1(xs)))
+        linear2(gelu(linear1(xs)))
     }
 }
 
