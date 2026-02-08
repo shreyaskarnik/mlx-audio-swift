@@ -183,52 +183,80 @@ class STTViewModel {
         isGenerating = false
     }
 
-    // MARK: - Recording
+    // MARK: - Live Recording & Transcription
+    //
+    // Dual-chunk system:
+    //  - Fast chunks (~2s): quick transcription for immediate feedback → pendingText
+    //  - Correction chunks (~10s): re-transcribe full pending window → replaces pendingText, promotes to confirmedText
+    //  - Display = confirmedText + pendingText
+
+    private let fastInterval: Double = 2.0
+    private let correctionInterval: Double = 10.0
+    private let sampleRate = 16000
+
+    private var liveTask: Task<Void, Never>?
+    private var correctionTask: Task<Void, Never>?
+
+    /// Text confirmed by correction chunks (high quality)
+    private var confirmedText: String = ""
+    /// Text from fast chunks (may have errors, will be replaced by correction)
+    private var pendingText: String = ""
+    /// Sample position where confirmedText ends
+    private var confirmedSampleEnd: Int = 0
+    /// Sample position where last fast chunk ended
+    private var fastChunkEnd: Int = 0
 
     func startRecording() {
         errorMessage = nil
         transcriptionText = ""
+        confirmedText = ""
+        pendingText = ""
+        confirmedSampleEnd = 0
+        fastChunkEnd = 0
         tokensPerSecond = 0
         peakMemory = 0
 
-        // AVAudioEngine triggers its own system permission prompt when accessing
-        // the input node. Just try to start — if permission is denied, it will throw.
         do {
             try recorder.startRecording()
         } catch {
             errorMessage = error.localizedDescription
-        }
-    }
-
-    func stopAndTranscribe() {
-        guard let audio = recorder.stopRecording() else {
-            errorMessage = "No audio recorded"
             return
         }
 
-        generationTask = Task {
-            await transcribeAudio(audio)
+        liveTask = Task {
+            await liveTranscriptionLoop()
         }
     }
 
-    func cancelRecording() {
-        recorder.cancelRecording()
+    private func liveTranscriptionLoop() async {
+        var timeSinceCorrection: Double = 0
+
+        while !Task.isCancelled && recorder.isRecording {
+            try? await Task.sleep(for: .seconds(fastInterval))
+            guard !Task.isCancelled && recorder.isRecording else { break }
+            timeSinceCorrection += fastInterval
+
+            // Fire off correction in the background if enough time has passed
+            if timeSinceCorrection >= correctionInterval {
+                timeSinceCorrection = 0
+                startCorrectionChunk()
+            }
+
+            // Always run fast chunks (even while correction runs in background)
+            await runFastChunk()
+        }
     }
 
-    private func transcribeAudio(_ audio: MLXArray) async {
-        guard let model = model else {
-            errorMessage = "Model not loaded"
-            return
-        }
+    /// Fast chunk: transcribe only new audio since last fast chunk. Streams tokens to pendingText.
+    private func runFastChunk() async {
+        guard let model = model else { return }
+        guard let (audio, endPos) = recorder.getAudio(from: fastChunkEnd) else { return }
+        fastChunkEnd = endPos
 
         isGenerating = true
-        errorMessage = nil
         generationProgress = "Transcribing..."
-        tokensPerSecond = 0
-        peakMemory = 0
 
         do {
-            var tokenCount = 0
             for try await event in model.generateStream(
                 audio: audio,
                 maxTokens: maxTokens,
@@ -237,38 +265,164 @@ class STTViewModel {
                 chunkDuration: chunkDuration
             ) {
                 try Task.checkCancellation()
-
                 switch event {
                 case .token(let token):
-                    transcriptionText += token
-                    tokenCount += 1
-                    generationProgress = "Transcribing... \(tokenCount) tokens"
+                    pendingText += token
+                    transcriptionText = confirmedText + pendingText
                 case .info(let info):
                     tokensPerSecond = info.tokensPerSecond
                     peakMemory = info.peakMemoryUsage
                 case .result:
-                    generationProgress = ""
+                    break
                 }
             }
-
-            generationProgress = ""
         } catch is CancellationError {
             Memory.clearCache()
-            generationProgress = ""
         } catch {
             errorMessage = "Transcription failed: \(error.localizedDescription)"
-            generationProgress = ""
         }
 
+        generationProgress = ""
         isGenerating = false
     }
 
+    /// Fire-and-forget correction: re-transcribe all audio from confirmedSampleEnd in the background.
+    /// When done, promotes result to confirmedText and resets pending. Skips if already running.
+    private func startCorrectionChunk() {
+        guard correctionTask == nil else { return }
+        guard let model = model else { return }
+        let currentEnd = recorder.sampleCount
+        guard currentEnd > confirmedSampleEnd else { return }
+        guard let (audio, endPos) = recorder.getAudio(from: confirmedSampleEnd) else { return }
+
+        correctionTask = Task {
+            var correctionText = ""
+            do {
+                for try await event in model.generateStream(
+                    audio: audio,
+                    maxTokens: maxTokens,
+                    temperature: temperature,
+                    language: language,
+                    chunkDuration: chunkDuration
+                ) {
+                    try Task.checkCancellation()
+                    switch event {
+                    case .token(let token):
+                        correctionText += token
+                    case .info(let info):
+                        tokensPerSecond = info.tokensPerSecond
+                        peakMemory = info.peakMemoryUsage
+                    case .result:
+                        break
+                    }
+                }
+            } catch is CancellationError {
+                Memory.clearCache()
+            } catch {
+                errorMessage = "Transcription failed: \(error.localizedDescription)"
+            }
+
+            // Replace pending with correction result and promote
+            if !correctionText.isEmpty {
+                confirmedText += correctionText
+                pendingText = ""
+                confirmedSampleEnd = endPos
+                fastChunkEnd = endPos
+                transcriptionText = confirmedText
+            }
+
+            correctionTask = nil
+        }
+    }
+
+    func stopRecording() {
+        liveTask?.cancel()
+        liveTask = nil
+        correctionTask?.cancel()
+        correctionTask = nil
+
+        // Final correction: transcribe everything since last confirmed position
+        let finalStart = confirmedSampleEnd
+        let hasPending = recorder.sampleCount > finalStart
+
+        _ = recorder.stopRecording()
+
+        if hasPending, let (audio, _) = recorder.getAudio(from: finalStart) {
+            generationTask = Task {
+                guard let model = model else { return }
+
+                isGenerating = true
+                generationProgress = "Final transcription..."
+                pendingText = ""
+
+                var finalText = ""
+                do {
+                    for try await event in model.generateStream(
+                        audio: audio,
+                        maxTokens: maxTokens,
+                        temperature: temperature,
+                        language: language,
+                        chunkDuration: chunkDuration
+                    ) {
+                        try Task.checkCancellation()
+                        switch event {
+                        case .token(let token):
+                            finalText += token
+                            pendingText = finalText
+                            transcriptionText = confirmedText + pendingText
+                        case .info(let info):
+                            tokensPerSecond = info.tokensPerSecond
+                            peakMemory = info.peakMemoryUsage
+                        case .result:
+                            break
+                        }
+                    }
+                } catch is CancellationError {
+                    Memory.clearCache()
+                } catch {
+                    errorMessage = "Transcription failed: \(error.localizedDescription)"
+                }
+
+                if !finalText.isEmpty {
+                    confirmedText += finalText
+                    pendingText = ""
+                    transcriptionText = confirmedText
+                }
+
+                generationProgress = ""
+                isGenerating = false
+            }
+        } else {
+            // Promote any remaining pending text
+            confirmedText += pendingText
+            pendingText = ""
+            transcriptionText = confirmedText
+        }
+    }
+
+    func cancelRecording() {
+        liveTask?.cancel()
+        liveTask = nil
+        correctionTask?.cancel()
+        correctionTask = nil
+        recorder.cancelRecording()
+        confirmedSampleEnd = 0
+        fastChunkEnd = 0
+    }
+
+
     func stop() {
+        liveTask?.cancel()
+        liveTask = nil
+        correctionTask?.cancel()
+        correctionTask = nil
         generationTask?.cancel()
         generationTask = nil
 
         if isRecording {
             recorder.cancelRecording()
+            confirmedSampleEnd = 0
+            fastChunkEnd = 0
         }
 
         if isGenerating {

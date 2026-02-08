@@ -151,7 +151,7 @@ struct STTView: View {
                 // Record button
                 Button(action: {
                     if viewModel.isRecording {
-                        viewModel.stopAndTranscribe()
+                        viewModel.stopRecording()
                     } else {
                         viewModel.startRecording()
                     }
@@ -159,7 +159,7 @@ struct STTView: View {
                     ViewThatFits(in: .horizontal) {
                         HStack(spacing: 6) {
                             Image(systemName: viewModel.isRecording ? "stop.circle.fill" : "mic.fill")
-                            Text(viewModel.isRecording ? "Stop & Transcribe" : "Record")
+                            Text(viewModel.isRecording ? "Stop" : "Record")
                         }
                         .font(buttonFont)
                         .fontWeight(viewModel.isRecording ? .medium : .regular)
@@ -178,7 +178,7 @@ struct STTView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(viewModel.isGenerating || !viewModel.isModelLoaded)
+                .disabled(!viewModel.isModelLoaded)
 
                 if !viewModel.isRecording {
                     // Settings button
