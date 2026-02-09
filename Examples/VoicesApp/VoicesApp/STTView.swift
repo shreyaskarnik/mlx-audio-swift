@@ -163,7 +163,7 @@ struct STTView: View {
                         }
                         .font(buttonFont)
                         .fontWeight(viewModel.isRecording ? .medium : .regular)
-                        .foregroundStyle(viewModel.isRecording ? .white : .primary)
+                        .foregroundStyle(viewModel.isRecording ? .white : .red)
                         .frame(height: buttonHeight)
                         .padding(.horizontal, 12)
                         .background(viewModel.isRecording ? Color.red : Color.gray.opacity(0.2))
