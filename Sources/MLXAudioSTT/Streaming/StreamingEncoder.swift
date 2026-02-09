@@ -13,12 +13,14 @@ import MLX
 /// Accumulates mel frames until a full window (800 frames = ~8s audio) is ready,
 /// then encodes via `encoder.encodeSingleWindow()`. Each encoded window produces
 /// ~104 encoder tokens of dimension 2048.
+/// Consecutive windows can overlap by a configurable number of mel frames.
 ///
 /// Since the encoder uses block attention (no cross-window attention), new windows
 /// can be encoded independently and concatenated with previous results.
 public class StreamingEncoder {
     private let encoder: Qwen3ASRAudioEncoder
     private let windowSize: Int  // nWindowInfer = 800 mel frames
+    private let windowStride: Int
     private let maxCachedWindows: Int
 
     /// Cached encoded window outputs
@@ -38,9 +40,15 @@ public class StreamingEncoder {
     /// Number of pending mel frames
     private var pendingFrameCount: Int = 0
 
-    public init(encoder: Qwen3ASRAudioEncoder, maxCachedWindows: Int = 60) {
+    public init(
+        encoder: Qwen3ASRAudioEncoder,
+        maxCachedWindows: Int = 60,
+        overlapFrames: Int = 0
+    ) {
         self.encoder = encoder
         self.windowSize = encoder.nWindowInfer  // 800
+        let clampedOverlap = max(0, min(overlapFrames, max(0, encoder.nWindowInfer - 1)))
+        self.windowStride = max(1, encoder.nWindowInfer - clampedOverlap)
         self.maxCachedWindows = maxCachedWindows
     }
 
@@ -72,8 +80,8 @@ public class StreamingEncoder {
             newWindows += 1
 
             // Trim pending
-            if pendingFrameCount > windowSize {
-                pendingFrames = frames[windowSize...]
+            if pendingFrameCount > windowStride {
+                pendingFrames = frames[windowStride...]
                 pendingFrameCount = pendingFrames!.dim(0)
             } else {
                 pendingFrames = nil

@@ -21,6 +21,7 @@ private struct SessionSharedState: Sendable {
     var confirmedTokenIds: [Int] = []
     var provisionalTokenIds: [Int] = []
     var provisionalFirstSeen: [Date] = []
+    var provisionalAgreementCounts: [Int] = []
     var confirmedText: String = ""
     var isDecoding: Bool = false
 }
@@ -36,6 +37,8 @@ private struct DecodePassParams: Sendable {
     let displayPrefix: String
     let prevProvisional: [Int]
     let prevFirstSeen: [Date]
+    let prevAgreementCounts: [Int]
+    let minAgreementPasses: Int
 }
 
 private struct FinalizeWindowsParams: Sendable {
@@ -75,6 +78,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
     private var isActive: Bool = false
     private var totalSamplesFed: Int = 0
     private var lastDecodeTime: Date?
+    private var boundaryFastDecodeUntil: Date?
     private var hasNewEncoderContent: Bool = false
     /// Number of encoder windows whose text has been frozen into completedText.
     private var frozenWindowCount: Int = 0
@@ -88,6 +92,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
     public init(model: Qwen3ASRModel, config: StreamingConfig = StreamingConfig()) {
         self.model = model
         self.config = config
+        let overlapFrames = max(0, Int(round(config.encoderWindowOverlapSeconds * Double(model.sampleRate) / 160.0)))
         self.melProcessor = IncrementalMelSpectrogram(
             sampleRate: model.sampleRate,
             nFft: 400,
@@ -96,7 +101,8 @@ public class StreamingInferenceSession: @unchecked Sendable {
         )
         self.encoder = StreamingEncoder(
             encoder: model.audioTower,
-            maxCachedWindows: config.maxCachedWindows
+            maxCachedWindows: config.maxCachedWindows,
+            overlapFrames: overlapFrames
         )
 
         var continuation: AsyncStream<TranscriptionEvent>.Continuation!
@@ -119,11 +125,32 @@ public class StreamingInferenceSession: @unchecked Sendable {
             }
 
             let now = Date()
+            if newWindows > 0 {
+                let boostSeconds = max(0, config.boundaryBoostSeconds)
+                if boostSeconds > 0 {
+                    boundaryFastDecodeUntil = now.addingTimeInterval(boostSeconds)
+                } else {
+                    boundaryFastDecodeUntil = nil
+                }
+            }
+
+            let effectiveDecodeIntervalSeconds: Double
+            if let boundaryFastDecodeUntil,
+               now < boundaryFastDecodeUntil
+            {
+                let fastInterval = max(0.05, config.boundaryDecodeIntervalSeconds)
+                let normalInterval = max(0.05, config.decodeIntervalSeconds)
+                effectiveDecodeIntervalSeconds = min(fastInterval, normalInterval)
+            } else {
+                boundaryFastDecodeUntil = nil
+                effectiveDecodeIntervalSeconds = max(0.05, config.decodeIntervalSeconds)
+            }
+
             let shouldDecode: Bool
             if config.finalizeCompletedWindows, newWindows > 0 {
                 shouldDecode = true
             } else if let lastDecode = lastDecodeTime {
-                shouldDecode = now.timeIntervalSince(lastDecode) >= config.decodeIntervalSeconds
+                shouldDecode = now.timeIntervalSince(lastDecode) >= effectiveDecodeIntervalSeconds
             } else {
                 shouldDecode = hasNewEncoderContent
             }
@@ -167,6 +194,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
             state.confirmedTokenIds = []
             state.provisionalTokenIds = []
             state.provisionalFirstSeen = []
+            state.provisionalAgreementCounts = []
             state.confirmedText = ""
         }
 
@@ -213,15 +241,23 @@ public class StreamingInferenceSession: @unchecked Sendable {
             return
         }
 
-        let snapshot = shared.withLock { state -> (Int, String, [Int], [Date]) in
+        let snapshot = shared.withLock { state -> ([Int], String, [Int], [Date], [Int]) in
             let prefix = Self.concatText(state.completedText, state.confirmedText)
-            return (state.confirmedTokenIds.count,
+            return (state.confirmedTokenIds,
                     prefix,
                     state.provisionalTokenIds,
-                    state.provisionalFirstSeen)
+                    state.provisionalFirstSeen,
+                    state.provisionalAgreementCounts)
         }
-        let (_, displayPrefix, prevProvisional, prevFirstSeen) = snapshot
-        let confirmedTokenIds = shared.withLock { $0.confirmedTokenIds }
+        let (confirmedTokenIds, displayPrefix, prevProvisional, prevFirstSeen, prevAgreementCounts) = snapshot
+        let minAgreementPasses: Int
+        if let boundaryFastDecodeUntil,
+           Date() < boundaryFastDecodeUntil
+        {
+            minAgreementPasses = max(1, max(config.minAgreementPasses, config.boundaryMinAgreementPasses))
+        } else {
+            minAgreementPasses = max(1, config.minAgreementPasses)
+        }
 
         let params = DecodePassParams(
             audioFeatures: UncheckedSendableBox(audioFeatures),
@@ -230,7 +266,9 @@ public class StreamingInferenceSession: @unchecked Sendable {
             confirmedTokenIds: confirmedTokenIds,
             displayPrefix: displayPrefix,
             prevProvisional: prevProvisional,
-            prevFirstSeen: prevFirstSeen
+            prevFirstSeen: prevFirstSeen,
+            prevAgreementCounts: prevAgreementCounts,
+            minAgreementPasses: minAgreementPasses
         )
 
         let continuation = self.continuation
@@ -254,16 +292,50 @@ public class StreamingInferenceSession: @unchecked Sendable {
     }
 
     private static func appendText(_ segment: String, to base: inout String) {
-        guard !segment.isEmpty else { return }
+        let normalizedSegment = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSegment.isEmpty else { return }
         if base.isEmpty {
-            base = segment
+            base = normalizedSegment
             return
         }
-        if base.last?.isWhitespace == true || segment.first?.isWhitespace == true {
-            base += segment
+        let dedupedSegment = dedupeLeadingWordOverlap(base: base, segment: normalizedSegment)
+        guard !dedupedSegment.isEmpty else { return }
+        if base.last?.isWhitespace == true || dedupedSegment.first?.isWhitespace == true {
+            base += dedupedSegment
         } else {
-            base += " " + segment
+            base += " " + dedupedSegment
         }
+    }
+
+    private static func dedupeLeadingWordOverlap(base: String, segment: String, maxWords: Int = 16) -> String {
+        let baseWords = base.split(whereSeparator: \.isWhitespace).map(String.init)
+        let segmentWords = segment.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !baseWords.isEmpty, !segmentWords.isEmpty else { return segment }
+
+        let maxOverlap = min(maxWords, min(baseWords.count, segmentWords.count))
+        var overlapCount = 0
+
+        if maxOverlap > 0 {
+            for size in stride(from: maxOverlap, through: 1, by: -1) {
+                var matches = true
+                for idx in 0..<size {
+                    let lhs = baseWords[baseWords.count - size + idx]
+                    let rhs = segmentWords[idx]
+                    if lhs.caseInsensitiveCompare(rhs) != .orderedSame {
+                        matches = false
+                        break
+                    }
+                }
+                if matches {
+                    overlapCount = size
+                    break
+                }
+            }
+        }
+
+        guard overlapCount > 0 else { return segment }
+        let remainder = segmentWords.dropFirst(overlapCount)
+        return remainder.joined(separator: " ")
     }
 
     private static func concatText(_ a: String, _ b: String) -> String {
@@ -397,6 +469,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
         let confirmedCount = params.confirmedTokenIds.count
         let prevProvisional = params.prevProvisional
         let prevFirstSeen = params.prevFirstSeen
+        let prevAgreementCounts = params.prevAgreementCounts
 
         let newProvisional = Array(allTokenIds.dropFirst(confirmedCount))
 
@@ -413,9 +486,29 @@ public class StreamingInferenceSession: @unchecked Sendable {
             }
         }
 
+        var nextFirstSeen: [Date] = []
+        nextFirstSeen.reserveCapacity(newProvisional.count)
+        var nextAgreementCounts: [Int] = []
+        nextAgreementCounts.reserveCapacity(newProvisional.count)
+
+        for i in 0..<newProvisional.count {
+            if i < matchLen {
+                let firstSeen = i < prevFirstSeen.count ? prevFirstSeen[i] : now
+                let prevAgreement = i < prevAgreementCounts.count ? prevAgreementCounts[i] : 1
+                nextFirstSeen.append(firstSeen)
+                nextAgreementCounts.append(max(1, prevAgreement + 1))
+            } else {
+                nextFirstSeen.append(now)
+                nextAgreementCounts.append(1)
+            }
+        }
+
+        let requiredAgreementPasses = max(1, params.minAgreementPasses)
         var promotionCount = 0
-        for i in 0..<matchLen {
-            if i < prevFirstSeen.count && now.timeIntervalSince(prevFirstSeen[i]) >= delaySeconds {
+        for i in 0..<newProvisional.count {
+            let hasDelay = i < nextFirstSeen.count && now.timeIntervalSince(nextFirstSeen[i]) >= delaySeconds
+            let hasAgreement = i < nextAgreementCounts.count && nextAgreementCounts[i] >= requiredAgreementPasses
+            if hasDelay && hasAgreement {
                 promotionCount = i + 1
             } else {
                 break
@@ -423,26 +516,20 @@ public class StreamingInferenceSession: @unchecked Sendable {
         }
 
         let promoteCount = promotionCount
-        let matched = matchLen
-
         let finalProvisional = Array(newProvisional.dropFirst(promoteCount))
-        let finalFirstSeen: [Date] = (0..<finalProvisional.count).map { i in
-            let oldIdx = promoteCount + i
-            if oldIdx < matched && oldIdx < prevFirstSeen.count {
-                return prevFirstSeen[oldIdx]
-            }
-            return now
-        }
+        let finalFirstSeen = Array(nextFirstSeen.dropFirst(promoteCount))
+        let finalAgreementCounts = Array(nextAgreementCounts.dropFirst(promoteCount))
 
         let displayPrefix: String = sharedState.withLock { state in
             if promoteCount > 0 {
-                let promoted = Array(prevProvisional[0..<promoteCount])
+                let promoted = Array(newProvisional.prefix(promoteCount))
                 state.confirmedTokenIds.append(contentsOf: promoted)
                 state.confirmedText = tokenizer.decode(tokens: state.confirmedTokenIds)
                 continuation?.yield(.confirmed(text: Self.concatText(state.completedText, state.confirmedText)))
             }
             state.provisionalTokenIds = finalProvisional
             state.provisionalFirstSeen = finalFirstSeen
+            state.provisionalAgreementCounts = finalAgreementCounts
             return Self.concatText(state.completedText, state.confirmedText)
         }
 
@@ -513,20 +600,14 @@ public class StreamingInferenceSession: @unchecked Sendable {
             }
             if selectedWindowText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
 
-            let completedText = sharedState.withLock { state in
+            sharedState.withLock { state in
                 Self.appendText(selectedWindowText, to: &state.completedText)
                 state.confirmedTokenIds = []
                 state.provisionalTokenIds = []
                 state.provisionalFirstSeen = []
+                state.provisionalAgreementCounts = []
                 state.confirmedText = ""
-                return state.completedText
             }
-
-            continuation?.yield(.confirmed(text: completedText))
-            continuation?.yield(.displayUpdate(
-                confirmedText: completedText,
-                provisionalText: ""
-            ))
         }
 
         Memory.clearCache()
@@ -606,6 +687,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
                     state.confirmedTokenIds.append(contentsOf: state.provisionalTokenIds)
                     state.provisionalTokenIds = []
                     state.provisionalFirstSeen = []
+                    state.provisionalAgreementCounts = []
                 }
                 if let tokenizer = model.tokenizer, !state.confirmedTokenIds.isEmpty {
                     state.confirmedText = tokenizer.decode(tokens: state.confirmedTokenIds)
@@ -652,6 +734,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
                     state.confirmedTokenIds = []
                     state.provisionalTokenIds = []
                     state.provisionalFirstSeen = []
+                    state.provisionalAgreementCounts = []
                     state.confirmedText = ""
                 }
             }
@@ -681,6 +764,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
                 state.confirmedTokenIds = tokenIds
                 state.provisionalTokenIds = []
                 state.provisionalFirstSeen = []
+                state.provisionalAgreementCounts = []
                 state.confirmedText = tokenizer.decode(tokens: tokenIds)
                 return Self.concatText(state.completedText, state.confirmedText)
             }
@@ -700,6 +784,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
                     state.confirmedTokenIds.append(contentsOf: state.provisionalTokenIds)
                     state.provisionalTokenIds = []
                     state.provisionalFirstSeen = []
+                    state.provisionalAgreementCounts = []
                 }
                 if let tokenizer = model.tokenizer, !state.confirmedTokenIds.isEmpty {
                     state.confirmedText = tokenizer.decode(tokens: state.confirmedTokenIds)
@@ -720,6 +805,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
             stopTask = nil
             encoder.reset()
             melProcessor.reset()
+            boundaryFastDecodeUntil = nil
         }
 
         Memory.clearCache()
@@ -736,6 +822,7 @@ public class StreamingInferenceSession: @unchecked Sendable {
             continuation = nil
             encoder.reset()
             melProcessor.reset()
+            boundaryFastDecodeUntil = nil
         }
     }
 
